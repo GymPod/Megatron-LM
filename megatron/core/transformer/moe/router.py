@@ -23,7 +23,6 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
-from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -50,6 +49,7 @@ class Router(ABC, MegatronModule):
         self.moe_aux_loss_func = None
         self.layer_number = None
         self.is_mtp_layer = is_mtp_layer
+        self.is_mtp = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -214,9 +214,8 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        self.router_replay = None
-        if self.config.moe_enable_routing_replay:
-            self.router_replay = RouterReplay()
+        from miles.utils.replay_base import routing_replay_manager
+        routing_replay_manager.register_to_module(self, "routing_replay")
 
     def _maintain_float32_expert_bias(self):
         """
@@ -650,7 +649,7 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
-                router_replay=self.router_replay,
+                is_mtp=self.is_mtp,
             )
 
         # Apply token dropping to probs and routing_map.

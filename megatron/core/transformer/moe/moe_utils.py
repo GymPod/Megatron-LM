@@ -21,7 +21,6 @@ from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_para
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
-from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
 
@@ -680,6 +679,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    is_mtp: bool = False,
     dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
@@ -703,6 +703,8 @@ def topk_routing_with_score_function(
                                              recorded routing sequence.
 
                                               Defaults to None.
+        is_mtp (bool, optional): Whether this is an MTP layer. MTP layers bypass routing replay.
+                                 Defaults to False.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
 
@@ -776,15 +778,13 @@ def topk_routing_with_score_function(
             # Sorting top-k turned off during inference
             return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
+    from miles.utils.replay_base import routing_replay_manager
 
-        if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-        else:
-            return router_replay.get_replay_topk(
-                scores, topk, num_groups, group_topk, _compute_topk
-            )
+    # MTP layers cannot use rollout routing replay
+    if not is_mtp:
+        compute_topk = routing_replay_manager.get_topk_fn(_compute_topk, return_probs=True)
+    else:
+        compute_topk = _compute_topk
 
     # Precision notes:
     # - Logits are converted to fp32 for score functions.
