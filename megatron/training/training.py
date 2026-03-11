@@ -1562,6 +1562,7 @@ def wrap_model_chunks_with_ddp(
     bucket_sizes=None,
     disable_bucketing_per_chunk=None,
     disable_grad_buffers_cpu_backup=False,
+    disable_param_buffers_cpu_backup=False,
 ):
     """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
 
@@ -1663,6 +1664,8 @@ def wrap_model_chunks_with_ddp(
             chunk_kwargs["full_param_layout"] = layout
         if disable_grad_buffers_cpu_backup:
             chunk_kwargs["disable_grad_buffers_cpu_backup"] = True
+        if disable_param_buffers_cpu_backup:
+            chunk_kwargs["disable_param_buffers_cpu_backup"] = True
         wrapped.append(
             DP(
                 config=config,
@@ -1870,6 +1873,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
                 disable_grad_buffers_cpu_backup=getattr(
                     args, 'disable_grad_buffers_cpu_backup', False
+                ),
+                disable_param_buffers_cpu_backup=getattr(
+                    args, 'disable_param_buffers_cpu_backup', False
                 ),
             )
         # End of setup_stream
