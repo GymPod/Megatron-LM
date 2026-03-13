@@ -365,6 +365,15 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    offload_optimizer_states: bool = False
+    """
+    If True, offload optimizer states to CPU after each optimizer step and
+    reload them before the next optimizer step.
+    """
+
+    low_memory_resume: bool = False
+    """If True, allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM."""
+
     ################
     # Miscellaneous
     ################

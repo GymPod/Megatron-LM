@@ -2713,6 +2713,9 @@ def _add_checkpointing_args(parser):
                        help='Override the iteration stored in the loaded checkpoint. '
                             'Also resets consumed_train_samples accordingly so the '
                             'data loader replays samples from that iteration onward.')
+    group.add_argument('--low-memory-resume', action='store_true', default=False,
+                       help='Allocate optimizer states on CPU during distributed optimizer checkpoint loading '
+                       'to prevent GPU OOM on large peak memory.')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
