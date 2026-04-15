@@ -1896,6 +1896,8 @@ class SelfAttention(Attention):
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             if self.config.num_query_groups < self.world_size:
+                # gate has the same head layout as query before slicing.
+                # Apply the same TP slice so gate matches the per-rank query.
                 idx = get_tensor_model_parallel_rank() % (
                     self.world_size // self.config.num_query_groups
                 )
