@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -37,11 +39,73 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+
+
+def apply_true_on_policy_logits_contract(
+    logits: Optional[Tensor], *, vocab_size: Optional[int] = None
+) -> Optional[Tensor]:
+    """Match SGLang's gathered-logits contract before log-softmax."""
+    if logits is None:
+        return None
+    if vocab_size is not None:
+        if logits.shape[-1] < vocab_size:
+            raise RuntimeError(
+                f"true_on_policy_vocab_size={vocab_size} exceeds gathered logits width "
+                f"{logits.shape[-1]}."
+            )
+        logits = logits[..., :vocab_size]
+    return logits
+
+
+_TOP_LM_HEAD_BWD_DUMP_COUNTER = 0
+
+
+def _maybe_dump_lm_head_backward(name: str, tensor: Optional[Tensor]) -> None:
+    dump_dir = os.environ.get("MILES_LM_HEAD_BACKWARD_DEBUG_DIR")
+    if not dump_dir or tensor is None or not tensor.requires_grad:
+        return
+
+    def hook(grad: Tensor) -> Tensor:
+        global _TOP_LM_HEAD_BWD_DUMP_COUNTER
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        finite_mask = torch.isfinite(grad)
+        finite = grad[finite_mask]
+        stats = {
+            "rank": rank,
+            "name": name,
+            "shape": tuple(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": grad.numel(),
+            "finite": finite_mask.sum().item(),
+            "nan": torch.isnan(grad).sum().item(),
+            "inf": torch.isinf(grad).sum().item(),
+        }
+        if finite.numel() > 0:
+            finite_f = finite.float()
+            stats.update(
+                {
+                    "max_abs_finite": finite_f.abs().max().item(),
+                    "min_finite": finite_f.min().item(),
+                    "max_finite": finite_f.max().item(),
+                }
+            )
+        else:
+            stats.update({"max_abs_finite": None, "min_finite": None, "max_finite": None})
+        counter = _TOP_LM_HEAD_BWD_DUMP_COUNTER
+        _TOP_LM_HEAD_BWD_DUMP_COUNTER += 1
+        path = Path(dump_dir) / f"rank_{rank}_{counter:05d}_{name}.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"stats": stats}, path)
+        print(f"[MILES_LM_HEAD_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
+        return grad
+
+    tensor.register_hook(hook)
 
 
 class GPTModel(LanguageModule):
@@ -597,6 +661,13 @@ class GPTModel(LanguageModule):
             output_processor_context=output_processor_context,
         )
 
+    def _apply_true_on_policy_logits_contract(self, logits: Optional[Tensor]) -> Optional[Tensor]:
+        if not resolve_true_on_policy_runtime_policy(self.config).apply_logits_contract:
+            return logits
+        return apply_true_on_policy_logits_contract(
+            logits, vocab_size=self.config.true_on_policy_vocab_size
+        )
+
     def _postprocess(
         self,
         hidden_states,
@@ -739,12 +810,17 @@ class GPTModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
+        if has_config_logger_enabled(self.config) or labels is None:
+            _maybe_dump_lm_head_backward("lm_head_input_hidden_states", hidden_states)
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+            # Apply MuP output scaling to logits
+            logits = self._scale_logits(logits)
+            logits = self._apply_true_on_policy_logits_contract(logits)
+            _maybe_dump_lm_head_backward("lm_head_output_logits", logits)
+        else:
+            logits = None
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -771,7 +847,22 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        output_layer_kwargs = dict(
+            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if self.fuse_linear_cross_entropy:
+            loss = self.output_layer(
+                output_cross_entropy_loss=self.fuse_linear_cross_entropy,
+                labels=labels,
+                **output_layer_kwargs,
+            )
+        else:
+            _maybe_dump_lm_head_backward("lm_head_input_hidden_states", hidden_states)
+            logits, _ = self.output_layer(**output_layer_kwargs)
+            logits = self._scale_logits(logits)
+            logits = self._apply_true_on_policy_logits_contract(logits)
+            _maybe_dump_lm_head_backward("lm_head_output_logits", logits)
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss
 

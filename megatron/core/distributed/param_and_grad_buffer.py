@@ -4,6 +4,7 @@ import fnmatch
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -19,6 +20,7 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
+from miles_megatron_plugins.true_on_policy.debug import dump_param_and_grad_buffer_debug
 
 from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
 from ..fp8_utils import (
@@ -98,6 +100,7 @@ class _ParamAndGradBucket:
         bucket_id: int,
         param_index_map: Dict[torch.nn.Parameter, tuple],
         params_with_extra_main_grads: List[torch.nn.Parameter],
+        param_to_name: Dict[torch.nn.Parameter, str],
     ):
         self.params_list = params
         self.params = set(params)
@@ -111,6 +114,7 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        self.param_to_name = param_to_name
         # Derive bucket-local param offsets from the global param_index_map.
         self.param_to_index = {}
         for param in params:
@@ -262,6 +266,7 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+        self._grad_debug_dumped_buckets = set()
 
     def reset(self):
         """
@@ -314,8 +319,16 @@ class _ParamAndGradBucketGroup:
         all-reduce / reduce-scatter.
         """
         rerun_state_machine = get_rerun_state_machine()
+        grad_debug_dir = os.environ.get("MILES_GRAD_DEBUG_DIR")
         for i in range(len(self.buckets)):
             grad_norm = self.buckets[i].grad_data.norm(p=2)
+            if grad_debug_dir and not torch.isfinite(grad_norm).item():
+                dump_param_and_grad_buffer_debug(
+                    self,
+                    bucket_index=i,
+                    grad_norm=grad_norm,
+                    grad_debug_dir=grad_debug_dir,
+                )
             # check for NaN, Inf and unexpectedly large grads
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(
@@ -988,6 +1001,7 @@ class _ParamAndGradBuffer:
         self.ddp_config = ddp_config
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
+        self.param_to_name = param_to_name
 
         # Check that params are unique.
         unique_params = set()
@@ -1481,6 +1495,7 @@ class _ParamAndGradBuffer:
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            param_to_name=self.param_to_name,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

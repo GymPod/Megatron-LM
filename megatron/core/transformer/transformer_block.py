@@ -1,11 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -32,6 +35,8 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.typed_torch import apply_module, not_none
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -64,6 +69,57 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+_FINAL_LAYERNORM_BWD_DUMP_COUNTER = 0
+_WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = False
+
+
+def _maybe_dump_final_layernorm_backward(name: str, tensor: Optional[Tensor]) -> None:
+    dump_dir = os.environ.get("MILES_FINAL_LAYERNORM_BACKWARD_DEBUG_DIR")
+    if not dump_dir or tensor is None or not tensor.requires_grad:
+        return
+
+    def hook(grad: Tensor) -> Tensor:
+        global _FINAL_LAYERNORM_BWD_DUMP_COUNTER
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        finite_mask = torch.isfinite(grad)
+        finite = grad[finite_mask]
+        stats = {
+            "rank": rank,
+            "name": name,
+            "shape": tuple(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": grad.numel(),
+            "finite": finite_mask.sum().item(),
+            "nan": torch.isnan(grad).sum().item(),
+            "inf": torch.isinf(grad).sum().item(),
+        }
+        if finite.numel() > 0:
+            finite_f = finite.float()
+            stats.update(
+                {
+                    "max_abs_finite": finite_f.abs().max().item(),
+                    "min_finite": finite_f.min().item(),
+                    "max_finite": finite_f.max().item(),
+                }
+            )
+        else:
+            stats.update({"max_abs_finite": None, "min_finite": None, "max_finite": None})
+
+        counter = _FINAL_LAYERNORM_BWD_DUMP_COUNTER
+        _FINAL_LAYERNORM_BWD_DUMP_COUNTER += 1
+        path = Path(dump_dir) / f"rank_{rank}_{counter:05d}_{name}.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"stats": stats}, path)
+        print(f"[MILES_FINAL_LAYERNORM_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
+        return grad
+
+    tensor.register_hook(hook)
+
+
+def _get_sglang_cp_recompute_mode() -> str:
+    mode = os.environ.get("MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE", "disabled")
+    return mode.lower().replace("-", "_")
 
 
 def get_num_layers_to_build(
@@ -248,8 +304,15 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+            layer_norm = LayerNormImpl
+            if resolve_true_on_policy_runtime_policy(config).use_sglang_final_norm:
+                layer_norm = (
+                    SGLangFinalRMSNorm
+                    if getattr(config, "normalization", None) == "RMSNorm"
+                    else SGLangNorm
+                )
             return TransformerBlockSubmodules(
-                layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
+                layer_specs=[spec] * num_layers, layer_norm=layer_norm
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -436,6 +499,174 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
+
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        context: Tensor,
+        context_mask: Tensor,
+        rotary_pos_emb: Tensor,
+        attention_bias: Tensor,
+        packed_seq_params: PackedSeqParams,
+        use_inner_quantization_context: bool,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        """Forward method with activation checkpointing."""
+
+        def custom(start: int, end: int):
+            def custom_forward(
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask=None,
+            ):
+                for index in range(start, end):
+                    layer = self._get_layer(index)
+
+                    # Get appropriate inner quantization context
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        # TODO: check if fp4 is supported in this case
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    with inner_quantization_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            attention_bias=attention_bias,
+                            inference_context=None,
+                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                        )
+                return hidden_states, context
+
+            return custom_forward
+
+        def checkpoint_handler(forward_func):
+            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+            if true_on_policy_policy.use_ulysses_cp_recompute_fallback:
+                mode = _get_sglang_cp_recompute_mode()
+                global _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK
+                if mode in ("disabled", "disable", "off", "none", "false", "0"):
+                    if not _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK:
+                        logger.info(
+                            "Bypassing full activation recompute for SGLang Ulysses CP. "
+                            "Set MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE to "
+                            "'non_reentrant' or 'reentrant' to override."
+                        )
+                        _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
+                    return forward_func(
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                    )
+                if mode == "non_reentrant":
+                    if not _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK:
+                        logger.info(
+                            "Using non-reentrant torch checkpoint for SGLang Ulysses CP "
+                            "full recompute."
+                        )
+                        _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
+                    return torch_checkpoint(
+                        forward_func,
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                if mode != "reentrant":
+                    raise ValueError(
+                        "Invalid MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE value "
+                        f"{mode!r}; expected disabled, non_reentrant, or reentrant."
+                    )
+
+            # TODO: check if fp4 is supported in this case
+            if self.config.fp8 or self.config.fp4:
+                return te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    padding_mask,
+                )
+            else:
+                return tensor_parallel.checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    padding_mask,
+                )
+
+        if self.config.recompute_method == 'uniform':
+            # Uniformly divide the total number of Transformer layers and checkpoint
+            # the input activation of each divided chunk.
+            # A method to further reduce memory usage reducing checkpoints.
+            layer_idx = 0
+            while layer_idx < self.num_layers_per_pipeline_rank:
+                hidden_states, context = checkpoint_handler(
+                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
+                )
+
+                layer_idx += self.config.recompute_num_layers
+
+        elif self.config.recompute_method == 'block':
+            # Checkpoint the input activation of only a set number of individual
+            # Transformer layers and skip the rest.
+            # A method fully use the device memory removing redundant re-computation.
+            recompute_skip_num_layers = 0
+            for layer_idx in range(self.num_layers_per_pipeline_rank):
+                # Skip recomputation when input grad computation is not needed.
+                # Need to have at least one input tensor with gradient computation
+                # for re-enterant autograd engine.
+                # TODO: check if fp4 is supported in this case
+                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+                    recompute_skip_num_layers += 1
+                if (
+                    layer_idx >= recompute_skip_num_layers
+                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                ):
+                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                else:
+                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                    )
+        else:
+            raise ValueError("Invalid activation recompute method.")
+
+        return hidden_states
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -687,13 +918,30 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
-            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+            sglang_residual = (
+                getattr(hidden_states, "_sglang_residual", None)
+                if true_on_policy_policy.use_sglang_residual_pair
+                else None
+            )
+            _maybe_dump_final_layernorm_backward(
+                "final_layernorm_input_hidden_states", hidden_states
+            )
+            _maybe_dump_final_layernorm_backward(
+                "final_layernorm_input_sglang_residual", sglang_residual
+            )
+            if sglang_residual is not None:
+                hidden_states, _ = self.final_layernorm(hidden_states, sglang_residual)
+            else:
+                hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            _maybe_dump_final_layernorm_backward("final_layernorm_output", hidden_states)
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
+            _maybe_dump_final_layernorm_backward("final_layernorm_viewless_output", hidden_states)
 
         # If this TransformerBlock is empty, input and output hidden states will be the same node
         # on the computational graph and will lead to unexpected errors in pipeline schedules.

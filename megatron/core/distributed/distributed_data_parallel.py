@@ -11,12 +11,36 @@ from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+
+def _first_cp_comm_type(cp_comm_type):
+    if isinstance(cp_comm_type, list):
+        return cp_comm_type[0] if cp_comm_type else None
+    return cp_comm_type
+
+
+def _use_true_on_policy_ulysses_cp_gradient_scaling(config: TransformerConfig) -> bool:
+    """Return true when CP loss scaling is deferred to the CP gradient sum."""
+
+    return (
+        resolve_true_on_policy_runtime_policy(config).defer_ulysses_cp_loss_scaling_to_grad_sum
+        and getattr(config, "context_parallel_size", 1) > 1
+        and _first_cp_comm_type(getattr(config, "cp_comm_type", None)) == "a2a"
+        and not getattr(config, "calculate_per_token_loss", False)
+    )
+
+
+def _dense_gradient_scaling_factor(config: TransformerConfig, dp_cp_world_size: int) -> float:
+    if _use_true_on_policy_ulysses_cp_gradient_scaling(config):
+        return float(getattr(config, "context_parallel_size", 1)) / float(dp_cp_world_size)
+    return 1.0 / float(dp_cp_world_size)
 
 
 class DistributedDataParallel(_BaseDataParallel):
@@ -202,7 +226,9 @@ class DistributedDataParallel(_BaseDataParallel):
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
 
-                gradient_scaling_factor = 1.0 / data_parallel_world_size
+                gradient_scaling_factor = _dense_gradient_scaling_factor(
+                    config, data_parallel_world_size
+                )
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate buffers for each group.
@@ -218,7 +244,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 scaling_factor = gradient_scaling_factor
 
             if not config.calculate_per_token_loss:
-                target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
+                target_gradient_scaling_factor = _dense_gradient_scaling_factor(
+                    config, self.dp_cp_group.size()
+                )
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
