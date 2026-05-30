@@ -13,6 +13,8 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
+    "miles_megatron_plugins",
+    "miles_megatron_plugins.*",
 ]
 
 [tool.setuptools.dynamic]
@@ -237,7 +239,7 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "0048fbf2
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters
 py_version = 310                                                           # python 3.10 as a target version
-known_first_party = ["megatron"]                                           # FIRSTPARTY section
+known_first_party = ["megatron", "miles_megatron_plugins"]                 # FIRSTPARTY section
 known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 default_section = "THIRDPARTY"
