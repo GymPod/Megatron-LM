@@ -312,7 +312,12 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if self.mtp_process:
+        # MTP block concatenates [main(s); mtp(s)] -> 2s; process_mtp_loss (training,
+        # labels present) splits it back to main s. In an RL logprob-only forward
+        # (labels=None) process_mtp_loss is skipped, so running MTP here would leave a
+        # 2s hidden flowing into the main lm_head and corrupt main logprobs. MTP is
+        # only needed for the training loss, so skip it when labels is None.
+        if self.mtp_process and labels is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
