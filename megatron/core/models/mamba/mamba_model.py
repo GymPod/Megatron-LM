@@ -236,6 +236,7 @@ class MambaModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        mtp_labels: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -317,7 +318,7 @@ class MambaModel(LanguageModule):
         # (labels=None) process_mtp_loss is skipped, so running MTP here would leave a
         # 2s hidden flowing into the main lm_head and corrupt main logprobs. MTP is
         # only needed for the training loss, so skip it when labels is None.
-        if self.mtp_process and labels is not None:
+        if self.mtp_process and mtp_labels is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -332,10 +333,10 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None and labels is not None:
+        if self.config.mtp_num_layers is not None and mtp_labels is not None:
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
-                labels=labels,
+                labels=mtp_labels,
                 loss_mask=loss_mask,
                 output_layer=self.output_layer,
                 output_weight=output_weight,
