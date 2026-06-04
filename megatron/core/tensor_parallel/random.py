@@ -634,11 +634,21 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
+def _is_tensor_container(arg):
+    """Return True if arg is a non-empty list/tuple of tensors."""
+    return isinstance(arg, (list, tuple)) and len(arg) > 0 and all(isinstance(x, torch.Tensor) for x in arg)
+
+
 def checkpoint(
     function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
 ) -> _R:
     """Checkpoint a model or part of the model.
-    This has been directly copied from torch.utils.checkpoint."""
+    This has been directly copied from torch.utils.checkpoint.
+
+    Handles non-tensor args (e.g. list/tuple of tensors) by flattening them
+    into individual tensor args for save_for_backward, then reconstructing
+    them during recompute.  Non-tensor, non-container args are closure-captured.
+    """
     from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
@@ -646,7 +656,46 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+
+    # Fast path: all args are tensors or None -- no wrapping needed.
+    has_non_tensor = any(arg is not None and not isinstance(arg, torch.Tensor) for arg in args)
+    if not has_non_tensor:
+        return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+
+    _TENSOR = "t"
+    _TENSOR_CONTAINER = "tc"
+    _CONST = "c"
+
+    positional_specs = []
+    tensor_args = []
+
+    for arg in args:
+        if arg is None or isinstance(arg, torch.Tensor):
+            positional_specs.append((_TENSOR, len(tensor_args)))
+            tensor_args.append(arg)
+        elif _is_tensor_container(arg):
+            container_type = type(arg)
+            start_idx = len(tensor_args)
+            for t in arg:
+                tensor_args.append(t)
+            end_idx = len(tensor_args)
+            positional_specs.append((_TENSOR_CONTAINER, (container_type, start_idx, end_idx)))
+        else:
+            positional_specs.append((_CONST, arg))
+
+    def wrapped_function(*flat_tensors):
+        rebuilt_args = []
+        for spec_tag, payload in positional_specs:
+            if spec_tag == _TENSOR:
+                rebuilt_args.append(flat_tensors[payload])
+            elif spec_tag == _TENSOR_CONTAINER:
+                container_type, start, end = payload
+                rebuilt_args.append(container_type(flat_tensors[start:end]))
+            else:
+                rebuilt_args.append(payload)
+        return function(*rebuilt_args)
+
+    return CheckpointFunction.apply(wrapped_function, distribute_saved_activations, *tensor_args)
 
 
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
