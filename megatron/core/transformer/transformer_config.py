@@ -219,6 +219,10 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu."""
 
+    activation_func_clamp_shared_expert: bool = True
+    """If False, skip activation_func_clamp_value inside SharedExpertMLP so only routed MoE
+    experts get the clamp."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -284,8 +288,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4']] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4."""
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -335,6 +339,48 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    ####################
+    # DeepSeek V4
+    ####################
+    dsv4_mode: bool = False
+    """Enable DeepSeek V4 mode (MLA + MoE with window sparse attention, topk, hyper-connections)."""
+
+    dsv4_hc_mult: Optional[int] = None
+    """Hyper-Connection multiplier (number of HC streams)."""
+
+    dsv4_hc_sinkhorn_iters: int = 20
+    """Number of Sinkhorn iterations for HC doubly-stochastic normalization."""
+
+    dsv4_hc_eps: float = 1e-6
+    """Epsilon for HC Sinkhorn normalization."""
+
+    dsv4_compress_ratios: Optional[List[int]] = None
+    """Per-layer compression ratios for compressor. None or 0 means no compression."""
+
+    dsv4_compress_rope_theta: float = 40000.0
+    """RoPE theta for compressor positional embeddings."""
+
+    dsv4_o_groups: Optional[int] = None
+    """Number of output groups for grouped output projection."""
+
+    dsv4_o_lora_rank: Optional[int] = None
+    """LoRA rank for output projection."""
+
+    dsv4_n_hash_layers: int = 0
+    """Number of layers using hash routing (from layer 0). Remaining layers use learned routing."""
+
+    dsv4_window_size: int = 4096
+    """Window size for local window attention in sparse attention."""
+
+    vocab_size: Optional[int] = None
+    """Vocabulary size, passed through for hash routing tid2eid initialization."""
+
+    freeze_e_score_correction_bias: bool = False
+    """Freeze expert score correction bias during training."""
+
+    moe_router_freeze_gate: bool = False
+    """Freeze MoE router gate weights during training."""
 
     ####################
     # linear attention
@@ -1272,6 +1318,9 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.experimental_attention_variant == "dsv4":
+            self.dsv4_mode = True
 
         if self.experimental_attention_variant == "gated_delta_net":
             assert (
