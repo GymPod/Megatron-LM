@@ -11,6 +11,7 @@ from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
+import deep_gemm
 import torch
 
 try:
@@ -175,23 +176,31 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
+_DEEPGEMM_MIN_DIM = 16
+_DEEPGEMM_TMA_ALIGNMENT_BF16 = 16 // torch.bfloat16.itemsize  # 8 elements
 
+
+def _matmul_persistent_deepgemm(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
+    M, K = a.shape
+    K, N = b.shape
+    out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    deep_gemm.bf16_gemm_nn(a, b, out)
+    if bias is not None:
+        out += bias
+    return out
+
+
+def _matmul_persistent_triton(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+):
     NUM_SMS = get_compute_units()
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=dtype)
 
-    # 1D launch kernel where each block gets its own program.
     def grid(META):
         blocks_m = triton.cdiv(M, META["BLOCK_SIZE_M"])
         blocks_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
@@ -245,6 +254,30 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
         **configs[dtype],
     )
     return c
+
+
+def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
+    """Persistent matmul kernel used by batch-invariant GEMM."""
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+    assert (
+        bias is None or bias.dim() == 1
+    ), "Currently assuming bias is 1D, let Horace know if you run into this"
+
+    M, K = a.shape
+    K, N = b.shape
+
+    if (
+        a.dtype == torch.bfloat16
+        and a.is_contiguous()
+        and b.t().is_contiguous()
+        and N >= _DEEPGEMM_MIN_DIM
+        and N % _DEEPGEMM_TMA_ALIGNMENT_BF16 == 0
+        and K % _DEEPGEMM_TMA_ALIGNMENT_BF16 == 0
+    ):
+        return _matmul_persistent_deepgemm(a, b, bias)
+
+    return _matmul_persistent_triton(a, b, bias)
 
 
 @triton.jit
