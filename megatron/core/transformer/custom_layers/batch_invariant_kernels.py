@@ -521,6 +521,22 @@ def addmm_batch_invariant(bias, a, b):
     return matmul_persistent(a, b, bias=bias)
 
 
+def bmm_batch_invariant(a, b, *, out=None):
+    """Batch-invariant replacement for `aten::bmm` using persistent matmul per batch element."""
+    assert a.ndim == 3 and b.ndim == 3, "bmm requires 3D tensors"
+    assert a.shape[0] == b.shape[0], "Batch sizes must match"
+    assert a.shape[2] == b.shape[1], "Incompatible dimensions"
+    B, M, K = a.shape
+    N = b.shape[2]
+    if out is None:
+        c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
+    else:
+        c = out
+    for i in range(B):
+        c[i] = matmul_persistent(a[i], b[i])
+    return c
+
+
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
     assert not _half_to_float, "not implemented"
     return log_softmax(input, dim=dim)
@@ -1124,6 +1140,7 @@ def enable_batch_invariant_mode():
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
