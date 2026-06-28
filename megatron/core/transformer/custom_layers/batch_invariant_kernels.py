@@ -1046,7 +1046,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         # save rsigma in full precision for backward to match the TE behavior.
         x_dtype = x.dtype
         x_fp32 = x.float()
-        w_fp32 = weight.to(device=x.device, dtype=torch.float32)
+        w_fp32 = weight_eff.to(device=x.device, dtype=torch.float32)
         ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
         rsigma = torch.rsqrt(ms + eps)
         out_fp32 = (x_fp32 * rsigma) * w_fp32
