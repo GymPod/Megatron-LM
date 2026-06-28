@@ -764,8 +764,12 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
 
-        opA = A.transpose(0, 1).contiguous() if transa else A.contiguous()  # [K, O] or [I, O]
-        opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
+        # Do NOT call .contiguous() on transposed views. matmul_persistent
+        # checks b.transpose(0,1).is_contiguous() to route to DeepGEMM;
+        # calling .contiguous() here makes the tensor row-major, which fails
+        # that check and falls back to the Triton kernel (different numerics).
+        opA = A.transpose(0, 1) if transa else A
+        opB = B.transpose(0, 1) if transb else B
 
         # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
         if opA.dim() > 2:
