@@ -683,26 +683,37 @@ def _te_patch_for_batch_invariant():
         _TELinear._bik_orig_forward = _TELinear.forward
 
         def _te_linear_forward_patched(self, *args, **kwargs):
-            if self.gemm_bias_unfused_add and is_batch_invariant_mode_enabled():
-                _, bias_tensor = self._get_weight_and_bias_tensors()
-                if bias_tensor is not None:
-                    from transformer_engine.pytorch.utils import cast_if_needed
+            if not is_batch_invariant_mode_enabled() or self.parallel_mode != "row":
+                return _TELinear._bik_orig_forward(self, *args, **kwargs)
+            _, bias_tensor = self._get_weight_and_bias_tensors()
+            if bias_tensor is None:
+                return _TELinear._bik_orig_forward(self, *args, **kwargs)
+            from transformer_engine.pytorch.utils import cast_if_needed
 
-                    _set_pending_allreduce_bias(
-                        cast_if_needed(bias_tensor, self.activation_dtype)
-                    )
-                    # Suppress both paths that would add bias inside _bik_orig_forward:
-                    # - apply_bias=False prevents bias from being passed to GEMM
-                    # - gemm_bias_unfused_add=False prevents post-allreduce bias add
-                    self.apply_bias = False
-                    self.gemm_bias_unfused_add = False
-                    try:
-                        out = _TELinear._bik_orig_forward(self, *args, **kwargs)
-                    finally:
-                        self.apply_bias = True
-                        self.gemm_bias_unfused_add = True
-                    return out
-            return _TELinear._bik_orig_forward(self, *args, **kwargs)
+            _set_pending_allreduce_bias(
+                cast_if_needed(bias_tensor, self.activation_dtype)
+            )
+            # Suppress TE's bias paths during _bik_orig_forward:
+            # apply_bias=False: don't pass bias to GEMM
+            # gemm_bias_unfused_add=False: don't add bias after allreduce
+            # return_bias=False: don't return bias (caller would double-add it)
+            orig_apply = self.apply_bias
+            orig_unfused = self.gemm_bias_unfused_add
+            orig_return = self.return_bias
+            self.apply_bias = False
+            self.gemm_bias_unfused_add = False
+            self.return_bias = False
+            try:
+                out = _TELinear._bik_orig_forward(self, *args, **kwargs)
+            finally:
+                self.apply_bias = orig_apply
+                self.gemm_bias_unfused_add = orig_unfused
+                self.return_bias = orig_return
+            # If caller expects (output, bias) tuple, return None for bias
+            # since it's already fused into rank 0 via _tree_allreduce
+            if orig_return:
+                return out, None
+            return out
 
         _TELinear.forward = _te_linear_forward_patched
 
