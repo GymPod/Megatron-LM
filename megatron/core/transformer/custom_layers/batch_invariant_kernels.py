@@ -558,6 +558,7 @@ _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+_TE_ALLREDUCE_ORIG: Optional[Callable] = None
 
 
 def _import_module_if_available(name: str):
@@ -565,6 +566,34 @@ def _import_module_if_available(name: str):
     if spec is None:
         return None
     return importlib.import_module(name)
+
+
+def _tree_allreduce(
+    inp: torch.Tensor,
+    tp_group=None,
+    async_op: bool = False,
+):
+    """Tree all-reduce matching SGLang's deterministic tree summation order.
+
+    All-gathers partial results then sums in binary tree order to match
+    SGLang's tree_all_reduce_sum exactly, ensuring bit-identical results.
+    """
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size(tp_group)
+    if world_size == 1:
+        return inp, None
+
+    result = [torch.empty_like(inp) for _ in range(world_size)]
+    dist.all_gather(result, inp.contiguous(), group=tp_group)
+
+    for level in range(1, world_size.bit_length()):
+        for left in range(0, world_size, 1 << level):
+            right = left + (1 << (level - 1))
+            result[left] += result[right]
+
+    inp.copy_(result[0])
+    return inp, None
 
 
 def _te_patch_for_batch_invariant():
@@ -608,6 +637,12 @@ def _te_patch_for_batch_invariant():
     if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
         _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
         meg_te.general_gemm = _te_general_gemm_patched
+
+    # Patch allreduce to use deterministic tree reduction matching SGLang
+    global _TE_ALLREDUCE_ORIG
+    if _TE_ALLREDUCE_ORIG is None and hasattr(te_linear_mod, "allreduce"):
+        _TE_ALLREDUCE_ORIG = te_linear_mod.allreduce
+        te_linear_mod.allreduce = _tree_allreduce
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
@@ -665,6 +700,13 @@ def _te_unpatch_for_batch_invariant():
     if _TE_GENERAL_GEMM_ORIG is not None and hasattr(te_cpp, "general_gemm"):
         te_cpp.general_gemm = _TE_GENERAL_GEMM_ORIG
         _TE_GENERAL_GEMM_ORIG = None
+
+    # Restore allreduce
+    global _TE_ALLREDUCE_ORIG
+    te_linear_mod = _import_module_if_available("transformer_engine.pytorch.module.linear")
+    if _TE_ALLREDUCE_ORIG is not None and te_linear_mod is not None and hasattr(te_linear_mod, "allreduce"):
+        te_linear_mod.allreduce = _TE_ALLREDUCE_ORIG
+        _TE_ALLREDUCE_ORIG = None
 
     rms_cls = getattr(te, "RMSNorm", None)
     if rms_cls is None:
