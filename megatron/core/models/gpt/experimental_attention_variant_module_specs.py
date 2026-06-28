@@ -66,14 +66,18 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    fuse = backend.fuse_layernorm_and_linear()
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
+            in_proj=(
+                backend.column_parallel_layer_norm_linear() if fuse
+                else backend.column_parallel_linear()
+            ),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
-        metainfo={"fuse_input_layernorm": True},
+        metainfo={"fuse_input_layernorm": fuse},
     )
     return attention
 
@@ -489,7 +493,10 @@ def _get_self_attention_module_spec(
     if config.multi_latent_attention:
         attn_spec.metainfo["fuse_input_layernorm"] = False
     else:
-        attn_spec.metainfo["fuse_input_layernorm"] = backend.fuse_layernorm_and_linear()
+        fuse = backend.fuse_layernorm_and_linear()
+        attn_spec.metainfo["fuse_input_layernorm"] = fuse
+        if not fuse:
+            attn_spec.submodules.linear_qkv = backend.column_parallel_linear()
 
     return attn_spec
 

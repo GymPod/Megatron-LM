@@ -50,6 +50,12 @@ class TESpecProvider(BackendSpecProvider):
 
     def fuse_layernorm_and_linear(self) -> bool:
         """TE backend chooses a single module for layernorm and linear"""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
+
+        if is_batch_invariant_mode_enabled():
+            return False
         return True
 
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
