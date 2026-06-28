@@ -568,6 +568,21 @@ def _import_module_if_available(name: str):
     return importlib.import_module(name)
 
 
+_PENDING_ALLREDUCE_BIAS: Optional[torch.Tensor] = None
+
+
+def _set_pending_allreduce_bias(bias: Optional[torch.Tensor]):
+    """Set bias to be fused into rank 0 before tree all-reduce.
+
+    SGLang fuses bias into rank 0's GEMM output before all-reduce. TE adds
+    bias after all-reduce. This state bridges the gap: TE's Linear.forward
+    sets the pending bias, _tree_allreduce consumes it, and Linear.forward
+    skips its own bias add.
+    """
+    global _PENDING_ALLREDUCE_BIAS
+    _PENDING_ALLREDUCE_BIAS = bias
+
+
 def _tree_allreduce(
     inp: torch.Tensor,
     tp_group=None,
@@ -576,13 +591,25 @@ def _tree_allreduce(
     """Tree all-reduce matching SGLang's deterministic tree summation order.
 
     All-gathers partial results then sums in binary tree order to match
-    SGLang's tree_all_reduce_sum exactly, ensuring bit-identical results.
+    SGLang's tree_all_reduce_sum exactly. If _PENDING_ALLREDUCE_BIAS is set,
+    fuses bias into the local rank's result before gathering (matching SGLang's
+    behavior where rank 0 has bias fused via aten::addmm).
     """
+    global _PENDING_ALLREDUCE_BIAS
     import torch.distributed as dist
 
     world_size = dist.get_world_size(tp_group)
     if world_size == 1:
+        if _PENDING_ALLREDUCE_BIAS is not None:
+            inp += _PENDING_ALLREDUCE_BIAS
+            _PENDING_ALLREDUCE_BIAS = None
         return inp, None
+
+    # Fuse pending bias into local rank's partial (matching SGLang rank-0 bias)
+    rank = dist.get_rank(tp_group)
+    if _PENDING_ALLREDUCE_BIAS is not None and rank == 0:
+        inp = inp + _PENDING_ALLREDUCE_BIAS
+    _PENDING_ALLREDUCE_BIAS = None
 
     result = [torch.empty_like(inp) for _ in range(world_size)]
     dist.all_gather(result, inp.contiguous(), group=tp_group)
@@ -643,6 +670,41 @@ def _te_patch_for_batch_invariant():
     if _TE_ALLREDUCE_ORIG is None and hasattr(te_linear_mod, "allreduce"):
         _TE_ALLREDUCE_ORIG = te_linear_mod.allreduce
         te_linear_mod.allreduce = _tree_allreduce
+
+    # Patch TE Linear.forward to fuse bias into rank 0 before allreduce
+    # (matching SGLang's aten::addmm behavior for RowParallelLinear).
+    # SGLang's RowParallelLinear passes bias only to rank 0's F.linear call,
+    # so rank 0's partial has bias before all-reduce. TE adds bias after
+    # all-reduce on all ranks. We bridge this by setting _PENDING_ALLREDUCE_BIAS
+    # so _tree_allreduce fuses it into rank 0 before gathering.
+    from transformer_engine.pytorch.module.linear import Linear as _TELinear
+
+    if not hasattr(_TELinear, "_bik_orig_forward"):
+        _TELinear._bik_orig_forward = _TELinear.forward
+
+        def _te_linear_forward_patched(self, *args, **kwargs):
+            if self.gemm_bias_unfused_add and is_batch_invariant_mode_enabled():
+                _, bias_tensor = self._get_weight_and_bias_tensors()
+                if bias_tensor is not None:
+                    from transformer_engine.pytorch.utils import cast_if_needed
+
+                    _set_pending_allreduce_bias(
+                        cast_if_needed(bias_tensor, self.activation_dtype)
+                    )
+                    # Suppress both paths that would add bias inside _bik_orig_forward:
+                    # - apply_bias=False prevents bias from being passed to GEMM
+                    # - gemm_bias_unfused_add=False prevents post-allreduce bias add
+                    self.apply_bias = False
+                    self.gemm_bias_unfused_add = False
+                    try:
+                        out = _TELinear._bik_orig_forward(self, *args, **kwargs)
+                    finally:
+                        self.apply_bias = True
+                        self.gemm_bias_unfused_add = True
+                    return out
+            return _TELinear._bik_orig_forward(self, *args, **kwargs)
+
+        _TELinear.forward = _te_linear_forward_patched
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
