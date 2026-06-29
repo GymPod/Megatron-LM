@@ -67,12 +67,20 @@ def sglang_chunk_gated_delta_rule(
     query, key, value, g, beta,
     chunk_size=64, initial_state=None, output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    scale=None, initial_state_indices=None, cu_seqlens=None,
 ):
-    o, _, h = _sglang_chunk_gdr(
+    kwargs = dict(
         q=query, k=key, v=value, g=g, beta=beta,
         initial_state=initial_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
+    if scale is not None:
+        kwargs["scale"] = scale
+    if initial_state_indices is not None:
+        kwargs["initial_state_indices"] = initial_state_indices
+    if cu_seqlens is not None:
+        kwargs["cu_seqlens"] = cu_seqlens
+    o, _, h = _sglang_chunk_gdr(**kwargs)
     return o, None
 
 
@@ -359,6 +367,7 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        _gdn_cu_seqlens = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -389,6 +398,10 @@ class GatedDeltaNet(MegatronModule):
                 "Number of packed sequences must be greater than 0, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
+        elif packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "bshd":
+            _gdn_cu_seqlens = packed_seq_params.cu_seqlens_q
+            cu_seqlens_q = None
+            cu_seqlens_kv = None
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
@@ -518,17 +531,65 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
+        _num_v = value.shape[2]
+
+        if _gdn_cu_seqlens is not None and batch == 1:
+            _initial_state = torch.zeros(
+                1, _num_v, self.key_head_dim, self.value_head_dim,
+                dtype=torch.float32, device=query.device,
+            )
+            _initial_state_indices = torch.zeros(1, dtype=torch.int32, device=query.device)
+            core_attn_out, _ = sglang_chunk_gated_delta_rule(
+                query, key, value, g=g, beta=beta,
+                scale=self.key_head_dim ** -0.5,
+                initial_state=_initial_state,
+                initial_state_indices=_initial_state_indices,
+                cu_seqlens=_gdn_cu_seqlens.long(),
+                use_qk_l2norm_in_kernel=True,
+            )
+        elif _gdn_cu_seqlens is not None and batch > 1:
+            _real_lens = (_gdn_cu_seqlens[1:] - _gdn_cu_seqlens[:-1]).tolist()
+            _packed_q = torch.cat([query[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
+            _packed_k = torch.cat([key[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
+            _packed_v = torch.cat([value[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
+            _packed_g = torch.cat([g[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
+            _packed_beta = torch.cat([beta[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
+            _initial_state = torch.zeros(
+                batch, _num_v, self.key_head_dim, self.value_head_dim,
+                dtype=torch.float32, device=query.device,
+            )
+            _initial_state_indices = torch.arange(batch, dtype=torch.int32, device=query.device)
+            _packed_out, _ = sglang_chunk_gated_delta_rule(
+                _packed_q, _packed_k, _packed_v,
+                g=_packed_g, beta=_packed_beta,
+                scale=self.key_head_dim ** -0.5,
+                initial_state=_initial_state,
+                initial_state_indices=_initial_state_indices,
+                cu_seqlens=_gdn_cu_seqlens.long(),
+                use_qk_l2norm_in_kernel=True,
+            )
+            T = query.shape[1]
+            core_attn_out = torch.zeros(
+                batch, T, _packed_out.shape[2], _packed_out.shape[3],
+                dtype=_packed_out.dtype, device=_packed_out.device,
+            )
+            _offset = 0
+            for i in range(batch):
+                _rlen = _real_lens[i]
+                core_attn_out[i, :_rlen] = _packed_out[0, _offset:_offset + _rlen]
+                _offset += _rlen
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens_q,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
