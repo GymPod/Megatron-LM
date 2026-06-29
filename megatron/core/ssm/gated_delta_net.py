@@ -55,6 +55,27 @@ except ImportError:
 
     HAVE_FLA = False
 
+try:
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule as _sglang_chunk_gdr
+    HAVE_SGLANG_FLA = True
+except ImportError:
+    _sglang_chunk_gdr = None
+    HAVE_SGLANG_FLA = False
+
+
+def sglang_chunk_gated_delta_rule(
+    query, key, value, g, beta,
+    chunk_size=64, initial_state=None, output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    o, _, h = _sglang_chunk_gdr(
+        q=query, k=key, v=value, g=g, beta=beta,
+        initial_state=initial_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+    return o, None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -238,7 +259,10 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "partition_dim", 0)
 
         if self.config.deterministic_mode or self.config.batch_invariant_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
+            if HAVE_SGLANG_FLA:
+                self.gated_delta_rule = sglang_chunk_gated_delta_rule
+            else:
+                self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 
