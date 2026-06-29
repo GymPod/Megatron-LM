@@ -267,10 +267,7 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "partition_dim", 0)
 
         if self.config.deterministic_mode or self.config.batch_invariant_mode:
-            if HAVE_SGLANG_FLA:
-                self.gated_delta_rule = sglang_chunk_gated_delta_rule
-            else:
-                self.gated_delta_rule = torch_chunk_gated_delta_rule
+            self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 
@@ -534,50 +531,32 @@ class GatedDeltaNet(MegatronModule):
         _num_v = value.shape[2]
 
         if _gdn_cu_seqlens is not None and batch == 1:
-            _initial_state = torch.zeros(
-                1, _num_v, self.key_head_dim, self.value_head_dim,
-                dtype=torch.float32, device=query.device,
-            )
-            _initial_state_indices = torch.zeros(1, dtype=torch.int32, device=query.device)
-            core_attn_out, _ = sglang_chunk_gated_delta_rule(
-                query, key, value, g=g, beta=beta,
-                scale=self.key_head_dim ** -0.5,
-                initial_state=_initial_state,
-                initial_state_indices=_initial_state_indices,
-                cu_seqlens=_gdn_cu_seqlens.long(),
+            _content_len = int(_gdn_cu_seqlens[-1].item())
+            _q_s = query[:, :_content_len]
+            _k_s = key[:, :_content_len]
+            _v_s = value[:, :_content_len]
+            _g_s = g[:, :_content_len]
+            _b_s = beta[:, :_content_len]
+            _out_s, _ = self.gated_delta_rule(
+                _q_s, _k_s, _v_s, g=_g_s, beta=_b_s,
+                initial_state=None, output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
             )
+            core_attn_out = torch.zeros_like(query[:, :, :_num_v])
+            core_attn_out[:, :_content_len] = _out_s
         elif _gdn_cu_seqlens is not None and batch > 1:
             _real_lens = (_gdn_cu_seqlens[1:] - _gdn_cu_seqlens[:-1]).tolist()
-            _packed_q = torch.cat([query[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
-            _packed_k = torch.cat([key[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
-            _packed_v = torch.cat([value[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
-            _packed_g = torch.cat([g[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
-            _packed_beta = torch.cat([beta[i, :_real_lens[i]] for i in range(batch)], dim=0).unsqueeze(0)
-            _initial_state = torch.zeros(
-                batch, _num_v, self.key_head_dim, self.value_head_dim,
-                dtype=torch.float32, device=query.device,
-            )
-            _initial_state_indices = torch.arange(batch, dtype=torch.int32, device=query.device)
-            _packed_out, _ = sglang_chunk_gated_delta_rule(
-                _packed_q, _packed_k, _packed_v,
-                g=_packed_g, beta=_packed_beta,
-                scale=self.key_head_dim ** -0.5,
-                initial_state=_initial_state,
-                initial_state_indices=_initial_state_indices,
-                cu_seqlens=_gdn_cu_seqlens.long(),
-                use_qk_l2norm_in_kernel=True,
-            )
             T = query.shape[1]
-            core_attn_out = torch.zeros(
-                batch, T, _packed_out.shape[2], _packed_out.shape[3],
-                dtype=_packed_out.dtype, device=_packed_out.device,
-            )
-            _offset = 0
+            core_attn_out = query.new_zeros(batch, T, _num_v, self.value_head_dim)
             for i in range(batch):
-                _rlen = _real_lens[i]
-                core_attn_out[i, :_rlen] = _packed_out[0, _offset:_offset + _rlen]
-                _offset += _rlen
+                _rlen = int(_real_lens[i])
+                _out_i, _ = self.gated_delta_rule(
+                    query[i:i+1, :_rlen], key[i:i+1, :_rlen], value[i:i+1, :_rlen],
+                    g=g[i:i+1, :_rlen], beta=beta[i:i+1, :_rlen],
+                    initial_state=None, output_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                core_attn_out[i, :_rlen] = _out_i[0]
         else:
             core_attn_out, last_recurrent_state = self.gated_delta_rule(
                 query,
