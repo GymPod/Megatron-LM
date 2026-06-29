@@ -540,7 +540,7 @@ class GatedDeltaNet(MegatronModule):
             _out_s, _ = self.gated_delta_rule(
                 _q_s, _k_s, _v_s, g=_g_s, beta=_b_s,
                 initial_state=None, output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=False,
             )
             core_attn_out = torch.zeros_like(query[:, :, :_num_v])
             core_attn_out[:, :_content_len] = _out_s
@@ -554,7 +554,7 @@ class GatedDeltaNet(MegatronModule):
                     query[i:i+1, :_rlen], key[i:i+1, :_rlen], value[i:i+1, :_rlen],
                     g=g[i:i+1, :_rlen], beta=beta[i:i+1, :_rlen],
                     initial_state=None, output_final_state=False,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=False,
                 )
                 core_attn_out[i, :_rlen] = _out_i[0]
         else:
@@ -645,9 +645,10 @@ class GatedDeltaNet(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key
+        # Apply L2 norm to query and key (PyTorch to match SGLang inference exactly)
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            qk_f = query_key.contiguous().float()
+            query_key = (qk_f * torch.rsqrt((qk_f * qk_f).sum(dim=-1, keepdim=True) + 1e-6)).to(query_key.dtype)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
@@ -1128,8 +1129,10 @@ def torch_chunk_gated_delta_rule(
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        query = l2norm(query.contiguous(), eps=1e-6)
-        key = l2norm(key.contiguous(), eps=1e-6)
+        q_f = query.float()
+        k_f = key.float()
+        query = (q_f * torch.rsqrt((q_f * q_f).sum(dim=-1, keepdim=True) + 1e-6)).to(initial_dtype)
+        key = (k_f * torch.rsqrt((k_f * k_f).sum(dim=-1, keepdim=True) + 1e-6)).to(initial_dtype)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
