@@ -618,15 +618,17 @@ class GatedDeltaNet(MegatronModule):
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
-        # Output Norm
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
-        y = self.out_norm(x)
-        # Output gate
         gate = gate.reshape(-1, gate.shape[-1])
-        y = y * self.act_fn(gate.float())
-        y = y.to(x_dtype)
-        return y
+        # Fused RMSNorm + gate in fp32 to match SGLang's Triton kernel
+        x_f = x.float()
+        rstd = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)
+        weight = self.out_norm.weight.float()
+        if self.config.layernorm_zero_centered_gamma:
+            weight = weight + 1.0
+        y = (x_f * rstd) * weight * self.act_fn(gate.float())
+        return y.to(x_dtype)
 
     @jit_fuser
     def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
