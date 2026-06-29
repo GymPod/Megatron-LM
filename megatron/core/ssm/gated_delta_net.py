@@ -430,16 +430,17 @@ class GatedDeltaNet(MegatronModule):
         )
         if self.config.deterministic_mode or self.config.batch_invariant_mode:
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+            orig_dtype = qkv.dtype
             conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
+                input=qkv.float(),
+                weight=conv1d_weight.float(),
+                bias=conv1d_bias.float() if conv1d_bias is not None else None,
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
                 groups=self.conv_dim_local_tp // self.cp_size,
             )
-            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = self.act_fn(conv_out[..., :seq_len]).to(orig_dtype)
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
