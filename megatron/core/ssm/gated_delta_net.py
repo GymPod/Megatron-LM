@@ -58,6 +58,32 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _causal_depthwise_conv1d(x: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
+    """Deterministic causal depthwise conv1d without cuDNN.
+
+    cuDNN conv1d can select different algorithms across processes, producing
+    results that differ by 1-2 ULP at bf16 rounding boundaries. This manual
+    implementation uses only element-wise multiply-accumulate in a fixed order,
+    guaranteeing bit-identical results across any execution context.
+
+    Args:
+        x: [B, D, L] input tensor (fp32)
+        weight: [D, 1, K] depthwise conv kernel
+        bias: optional [D] bias
+
+    Returns: [B, D, L] convolution output (causal: output[t] depends on input[t-K+1:t+1])
+    """
+    K = weight.shape[2]
+    x_padded = F.pad(x, (K - 1, 0))
+    L = x.shape[2]
+    out = x_padded[:, :, 0:L] * weight[:, 0, 0].view(1, -1, 1)
+    for k in range(1, K):
+        out = out + x_padded[:, :, k:k + L] * weight[:, 0, k].view(1, -1, 1)
+    if bias is not None:
+        out = out + bias.view(1, -1, 1)
+    return out
+
+
 @dataclass
 class GatedDeltaNetSubmodules:
     """
@@ -431,14 +457,10 @@ class GatedDeltaNet(MegatronModule):
         if self.config.deterministic_mode or self.config.batch_invariant_mode:
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
             orig_dtype = qkv.dtype
-            conv_out = F.conv1d(
-                input=qkv.float(),
-                weight=conv1d_weight.float(),
-                bias=conv1d_bias.float() if conv1d_bias is not None else None,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+            conv_out = _causal_depthwise_conv1d(
+                qkv.float(),
+                conv1d_weight.float(),
+                conv1d_bias.float() if conv1d_bias is not None else None,
             )
             qkv = self.act_fn(conv_out[..., :seq_len]).to(orig_dtype)
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
