@@ -616,7 +616,6 @@ class GatedDeltaNet(MegatronModule):
 
         return out, out_bias
 
-    @jit_fuser
     def _apply_gated_norm(self, x, gate):
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
