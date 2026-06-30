@@ -63,6 +63,13 @@ except ImportError:
     HAVE_SGLANG_FLA = False
 
 try:
+    from sglang.srt.layers.attention.linear.gdn_backend import (
+        torch_chunk_gated_delta_rule as _sglang_torch_chunk_gdr,
+    )
+except ImportError:
+    _sglang_torch_chunk_gdr = None
+
+try:
     from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated as _sglang_rms_norm_gated
 except ImportError:
     _sglang_rms_norm_gated = None
@@ -563,10 +570,17 @@ class GatedDeltaNet(MegatronModule):
             )
         nvtx_range_pop(suffix="conv1d")
 
+        # In THD mode, defer L2 norm and repeat_interleave to the SGLang kernel
+        # call to match its exact operation sequence and produce bit-identical
+        # results.
+        _is_thd = (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        )
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
+            qkv, gate, beta, alpha, batch, seq_len, skip_l2norm_and_repeat=_is_thd
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
 
@@ -581,24 +595,27 @@ class GatedDeltaNet(MegatronModule):
 
         nvtx_range_push(suffix="gated_delta_rule")
         _num_v = value.shape[2]
-        _is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
 
         if _is_thd and _gdn_cu_seqlens is not None:
-            # THD: batch=1, all sequences packed along T. Process as one
-            # contiguous sequence (matching SGLang's batch_invariant path which
-            # does not reset recurrence at sequence boundaries).
+            # THD: call SGLang's torch_chunk_gated_delta_rule directly to match
+            # its exact L2norm + repeat_interleave + recurrence sequence.
             _content_len = int(_gdn_cu_seqlens[-1].item())
             _q_s = query[:, :_content_len]
             _k_s = key[:, :_content_len]
             _v_s = value[:, :_content_len]
             _g_s = g[:, :_content_len]
             _b_s = beta[:, :_content_len]
-            _out_s, _ = self.gated_delta_rule(
+            _out_s, _, _ = _sglang_torch_chunk_gdr(
                 _q_s, _k_s, _v_s, g=_g_s, beta=_b_s,
-                initial_state=None, output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
+                ssm_states=None,
+                cache_indices=None,
+                query_start_loc=_gdn_cu_seqlens,
             )
-            core_attn_out = torch.zeros_like(query[:, :, :_num_v])
+            _padded_len = query.shape[1]
+            core_attn_out = torch.zeros(
+                1, _padded_len, _num_v, value.shape[3],
+                dtype=value.dtype, device=value.device,
+            )
             core_attn_out[:, :_content_len] = _out_s
         elif _gdn_cu_seqlens is not None and batch == 1:
             _content_len = int(_gdn_cu_seqlens[-1].item())
@@ -713,10 +730,16 @@ class GatedDeltaNet(MegatronModule):
         return y
 
     @jit_fuser
-    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
+    def _prepare_qkv_for_gated_delta_rule(
+        self, qkv, gate, beta, alpha, batch, seq_len, skip_l2norm_and_repeat=False
+    ):
         """
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
         Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
+
+        In THD mode (``skip_l2norm_and_repeat=True``) the L2 norm and
+        repeat_interleave are deferred to SGLang's kernel call so the operation
+        sequence matches SGLang inference exactly for bit-identical results.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
@@ -730,7 +753,7 @@ class GatedDeltaNet(MegatronModule):
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
         # Apply L2 norm to query and key (PyTorch to match SGLang inference exactly)
-        if self.use_qk_l2norm:
+        if self.use_qk_l2norm and not skip_l2norm_and_repeat:
             qk_f = query_key.contiguous().float()
             query_key = (qk_f * torch.rsqrt((qk_f * qk_f).sum(dim=-1, keepdim=True) + 1e-6)).to(query_key.dtype)
 
@@ -739,7 +762,7 @@ class GatedDeltaNet(MegatronModule):
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
-        if self.num_value_heads // self.num_key_heads > 1:
+        if not skip_l2norm_and_repeat and self.num_value_heads // self.num_key_heads > 1:
             repeat_factor = self.num_value_heads // self.num_key_heads
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
