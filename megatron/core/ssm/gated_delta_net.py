@@ -597,26 +597,32 @@ class GatedDeltaNet(MegatronModule):
         _num_v = value.shape[2]
 
         if _is_thd and _gdn_cu_seqlens is not None:
-            # THD: call SGLang's torch_chunk_gated_delta_rule directly to match
-            # its exact L2norm + repeat_interleave + recurrence sequence.
-            _content_len = int(_gdn_cu_seqlens[-1].item())
-            _q_s = query[:, :_content_len]
-            _k_s = key[:, :_content_len]
-            _v_s = value[:, :_content_len]
-            _g_s = g[:, :_content_len]
-            _b_s = beta[:, :_content_len]
-            _out_s, _, _ = _sglang_torch_chunk_gdr(
-                _q_s, _k_s, _v_s, g=_g_s, beta=_b_s,
-                ssm_states=None,
-                cache_indices=None,
-                query_start_loc=_gdn_cu_seqlens,
-            )
+            # THD: call SGLang's torch_chunk_gated_delta_rule per packed sequence
+            # to match its exact L2norm + repeat_interleave + recurrence sequence.
+            # Each sequence is processed independently (recurrence resets between seqs).
             _padded_len = query.shape[1]
             core_attn_out = torch.zeros(
                 1, _padded_len, _num_v, value.shape[3],
                 dtype=value.dtype, device=value.device,
             )
-            core_attn_out[:, :_content_len] = _out_s
+            _num_seqs = _gdn_cu_seqlens.shape[0] - 1
+            for _seg_i in range(_num_seqs):
+                _seg_start = int(_gdn_cu_seqlens[_seg_i].item())
+                _seg_end = int(_gdn_cu_seqlens[_seg_i + 1].item())
+                if _seg_end <= _seg_start:
+                    continue
+                _seg_cu = torch.tensor([0, _seg_end - _seg_start], dtype=torch.int32, device=query.device)
+                _seg_out, _, _ = _sglang_torch_chunk_gdr(
+                    query[:, _seg_start:_seg_end],
+                    key[:, _seg_start:_seg_end],
+                    value[:, _seg_start:_seg_end],
+                    g=g[:, _seg_start:_seg_end],
+                    beta=beta[:, _seg_start:_seg_end],
+                    ssm_states=None,
+                    cache_indices=None,
+                    query_start_loc=_seg_cu,
+                )
+                core_attn_out[:, _seg_start:_seg_end] = _seg_out
         elif _gdn_cu_seqlens is not None and batch == 1:
             _content_len = int(_gdn_cu_seqlens[-1].item())
             _q_s = query[:, :_content_len]
