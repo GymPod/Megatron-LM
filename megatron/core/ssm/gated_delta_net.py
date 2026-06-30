@@ -445,6 +445,8 @@ class GatedDeltaNet(MegatronModule):
                 "Number of packed sequences must be greater than 0, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
+            # Drive the SGLang per-segment recurrence path for bit-identical THD.
+            _gdn_cu_seqlens = packed_seq_params.cu_seqlens_q
         elif packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "bshd":
             _gdn_cu_seqlens = packed_seq_params.cu_seqlens_q
             cu_seqlens_q = None
@@ -579,8 +581,26 @@ class GatedDeltaNet(MegatronModule):
 
         nvtx_range_push(suffix="gated_delta_rule")
         _num_v = value.shape[2]
+        _is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
 
-        if _gdn_cu_seqlens is not None and batch == 1:
+        if _is_thd and _gdn_cu_seqlens is not None:
+            # THD: batch=1, all sequences packed along T. Process as one
+            # contiguous sequence (matching SGLang's batch_invariant path which
+            # does not reset recurrence at sequence boundaries).
+            _content_len = int(_gdn_cu_seqlens[-1].item())
+            _q_s = query[:, :_content_len]
+            _k_s = key[:, :_content_len]
+            _v_s = value[:, :_content_len]
+            _g_s = g[:, :_content_len]
+            _b_s = beta[:, :_content_len]
+            _out_s, _ = self.gated_delta_rule(
+                _q_s, _k_s, _v_s, g=_g_s, beta=_b_s,
+                initial_state=None, output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+            )
+            core_attn_out = torch.zeros_like(query[:, :, :_num_v])
+            core_attn_out[:, :_content_len] = _out_s
+        elif _gdn_cu_seqlens is not None and batch == 1:
             _content_len = int(_gdn_cu_seqlens[-1].item())
             _q_s = query[:, :_content_len]
             _k_s = key[:, :_content_len]
