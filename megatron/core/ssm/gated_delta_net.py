@@ -62,6 +62,11 @@ except ImportError:
     _sglang_chunk_gdr = None
     HAVE_SGLANG_FLA = False
 
+try:
+    from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated as _sglang_rms_norm_gated
+except ImportError:
+    _sglang_rms_norm_gated = None
+
 
 def sglang_chunk_gated_delta_rule(
     query, key, value, g, beta,
@@ -620,14 +625,22 @@ class GatedDeltaNet(MegatronModule):
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
         gate = gate.reshape(-1, gate.shape[-1])
-        # Fused RMSNorm + gate in fp32 to match SGLang's Triton kernel
-        x_f = x.float()
-        rstd = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)
-        weight = self.out_norm.weight.float()
+        weight = self.out_norm.weight
         if self.config.layernorm_zero_centered_gamma:
             weight = weight + 1.0
-        y = (x_f * rstd) * weight * self.act_fn(gate.float())
-        return y.to(x_dtype)
+        if _sglang_rms_norm_gated is not None and not self.training:
+            y = _sglang_rms_norm_gated(
+                x=x, weight=weight, bias=None, z=gate,
+                eps=self.config.layernorm_epsilon,
+                norm_before_gate=True, is_rms_norm=True, activation='swish',
+            )
+        else:
+            x_f = x.float()
+            gate_f = gate.float()
+            rstd = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)
+            y = (x_f * rstd) * weight.float() * (gate_f * torch.sigmoid(gate_f))
+            y = y.to(x_dtype)
+        return y
 
     @jit_fuser
     def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
