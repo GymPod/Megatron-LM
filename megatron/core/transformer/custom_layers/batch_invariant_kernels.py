@@ -133,7 +133,7 @@ def matmul_kernel_persistent(
 
             a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
-            accumulator = tl.dot(a, b, accumulator)
+            accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
 
         tile_id_c += NUM_SMS
         pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
@@ -607,7 +607,7 @@ def bmm_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -643,11 +643,6 @@ def bmm_batch_invariant(a, b, *, out=None):
     B, M, K = a.shape
     N = b.shape[2]
     dtype = a.dtype
-
-    if dtype == torch.float32:
-        return torch.baddbmm(
-            torch.empty(B, M, N, device=a.device, dtype=dtype), a, b, beta=0.0, alpha=1.0
-        )
 
     if out is None:
         c = torch.empty((B, M, N), device=a.device, dtype=dtype)
