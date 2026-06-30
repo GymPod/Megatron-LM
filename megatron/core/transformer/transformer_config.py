@@ -147,6 +147,11 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
+    fallback_to_eager_attn: bool = False
+    """If True, fall back to the eager (unfused) attention implementation. Only available
+    with the transformer_engine implementation. For context parallelism, only the
+    all_gather communication type is supported."""
+
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
