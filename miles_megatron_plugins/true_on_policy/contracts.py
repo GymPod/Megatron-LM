@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from .schema import (
@@ -130,6 +130,8 @@ def validate_true_on_policy_contract(contract_name: Optional[str]) -> None:
 def resolve_true_on_policy_runtime_policy(config) -> MegatronTrueOnPolicyRuntimePolicy:
     contract_name = getattr(config, "true_on_policy_contract", None)
     if contract_name is None:
+        if getattr(config, "batch_invariant_mode", False):
+            return replace(DEFAULT_RUNTIME_POLICY, deterministic_row_parallel_reduce=True)
         return DEFAULT_RUNTIME_POLICY
 
     validate_true_on_policy_contract(contract_name)
