@@ -68,6 +68,51 @@ except ImportError:
     _sglang_rms_norm_gated = None
 
 
+class _SglangRmsNormGatedWithGrad(torch.autograd.Function):
+    """Use SGLang's Triton kernel for forward, PyTorch for backward."""
+
+    @staticmethod
+    def forward(ctx, x, gate, weight, eps):
+        ctx.save_for_backward(x, gate, weight)
+        ctx.eps = eps
+        with torch.no_grad():
+            y = _sglang_rms_norm_gated(
+                x=x, weight=weight, bias=None, z=gate,
+                eps=eps, norm_before_gate=True, is_rms_norm=True, activation='swish',
+            )
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, gate, weight = ctx.saved_tensors
+        eps = ctx.eps
+        x_f = x.float()
+        gate_f = gate.float()
+        w_f = weight.float()
+        go_f = grad_output.float()
+
+        rstd = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps)
+        x_hat = x_f * rstd
+        silu_gate = gate_f * torch.sigmoid(gate_f)
+        y_before_gate = x_hat * w_f
+
+        # grad w.r.t. gate: d/d(gate) of y_before_gate * gate * sigmoid(gate)
+        sig = torch.sigmoid(gate_f)
+        dsilu = sig * (1 + gate_f * (1 - sig))
+        grad_gate = (go_f * y_before_gate * dsilu).to(gate.dtype)
+
+        # grad w.r.t. weight
+        grad_weight = (go_f * x_hat * silu_gate).sum(0).to(weight.dtype)
+
+        # grad w.r.t. x: chain through rms_norm
+        dy = go_f * w_f * silu_gate
+        N = x_f.shape[-1]
+        grad_x = (dy - x_hat * (dy * x_hat).mean(-1, keepdim=True)) * rstd
+        grad_x = grad_x.to(x.dtype)
+
+        return grad_x, grad_gate, grad_weight, None
+
+
 def sglang_chunk_gated_delta_rule(
     query, key, value, g, beta,
     chunk_size=64, initial_state=None, output_final_state=False,
@@ -628,12 +673,17 @@ class GatedDeltaNet(MegatronModule):
         weight = self.out_norm.weight
         if self.config.layernorm_zero_centered_gamma:
             weight = weight + 1.0
-        if _sglang_rms_norm_gated is not None and not self.training:
-            y = _sglang_rms_norm_gated(
-                x=x, weight=weight, bias=None, z=gate,
-                eps=self.config.layernorm_epsilon,
-                norm_before_gate=True, is_rms_norm=True, activation='swish',
-            )
+        if _sglang_rms_norm_gated is not None:
+            if self.training:
+                y = _SglangRmsNormGatedWithGrad.apply(
+                    x, gate, weight, self.config.layernorm_epsilon
+                )
+            else:
+                y = _sglang_rms_norm_gated(
+                    x=x, weight=weight, bias=None, z=gate,
+                    eps=self.config.layernorm_epsilon,
+                    norm_before_gate=True, is_rms_norm=True, activation='swish',
+                )
         else:
             x_f = x.float()
             gate_f = gate.float()
