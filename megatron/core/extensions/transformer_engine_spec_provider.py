@@ -46,6 +46,12 @@ class TESpecProvider(BackendSpecProvider):
 
     def row_parallel_linear(self) -> type[TERowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
+
+        if is_batch_invariant_mode_enabled():
+            return RowParallelLinear
         return TERowParallelLinear
 
     def fuse_layernorm_and_linear(self) -> bool:
