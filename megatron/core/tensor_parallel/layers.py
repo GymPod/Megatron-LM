@@ -33,6 +33,12 @@ from megatron.core.utils import (
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+
+try:
+    from sglang.srt.tp_invariant_ops import matmul_tp_inv as _sglang_matmul_tp_inv
+except ImportError:
+    _sglang_matmul_tp_inv = None
+
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -1424,6 +1430,18 @@ class RowParallelLinear(torch.nn.Module):
         )
 
     def _forward_impl(self, input, weight, *args, **kwargs):
+        if (
+            not weight.requires_grad
+            and resolve_true_on_policy_runtime_policy(
+                self.config
+            ).deterministic_row_parallel_reduce
+            and _sglang_matmul_tp_inv is not None
+        ):
+            orig_shape = input.shape
+            return _sglang_matmul_tp_inv(
+                input.reshape(-1, orig_shape[-1]),
+                weight.t(),
+            ).reshape(*orig_shape[:-1], weight.shape[0])
         if not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
