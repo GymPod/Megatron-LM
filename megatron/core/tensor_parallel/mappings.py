@@ -62,6 +62,22 @@ def _tree_reduce_sum_from_gathered(gathered):
     return partials[0]
 
 
+def _tree_reduce_scatter_along_first_dim(input_, group):
+    """Deterministic reduce-scatter: all-gather + tree-reduce + local scatter.
+
+    Matches SGLang's tree_all_reduce_sum reduction order, then keeps
+    the local rank's sequence-parallel chunk.
+    """
+    assert group is not None
+    world_size = group.size()
+    if world_size == 1:
+        return input_
+    reduced = _tree_all_reduce_sum(input_, group)
+    rank = group.rank()
+    chunk_size = reduced.shape[0] // world_size
+    return reduced[rank * chunk_size : (rank + 1) * chunk_size].contiguous()
+
+
 def _tree_all_reduce_sum(input_, group):
     """Deterministic TP sum via all-gather plus fixed local tree reduction."""
     assert group is not None, "group should not be None"
@@ -477,6 +493,19 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         )
 
 
+class _DeterministicReduceScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Deterministic reduce-scatter matching SGLang's tree_all_reduce_sum order."""
+
+    @staticmethod
+    def forward(ctx, input_, group):
+        ctx.group = group
+        return _tree_reduce_scatter_along_first_dim(input_, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (_gather_along_first_dim(grad_output, ctx.group), None)
+
+
 class _AllGatherFromTensorParallelRegion(torch.autograd.Function):
     """Gather the input from model parallel region and concatenate."""
 
@@ -638,10 +667,12 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_, group=None, input_split_sizes=None, use_global_buffer=False
+    input_, group=None, input_split_sizes=None, use_global_buffer=False, deterministic=False
 ):
     """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if deterministic:
+        return _DeterministicReduceScatterToSequenceParallelRegion.apply(input_, group)
     return _ReduceScatterToSequenceParallelRegion.apply(
         input_, group, input_split_sizes, use_global_buffer
     )

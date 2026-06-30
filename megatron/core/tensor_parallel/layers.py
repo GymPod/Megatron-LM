@@ -1475,7 +1475,11 @@ class RowParallelLinear(torch.nn.Module):
             output_ = output_parallel
         elif self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
+                output_parallel,
+                group=self.tp_group,
+                deterministic=resolve_true_on_policy_runtime_policy(
+                    self.config
+                ).deterministic_row_parallel_reduce,
             )
         else:
             output_ = reduce_from_tensor_model_parallel_region(

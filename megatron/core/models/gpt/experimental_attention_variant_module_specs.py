@@ -5,6 +5,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.tensor_parallel import RowParallelLinear
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -75,7 +76,7 @@ def get_gated_delta_net_module_spec(
                 else backend.column_parallel_linear()
             ),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
-            out_proj=backend.row_parallel_linear(),
+            out_proj=RowParallelLinear,
         ),
         metainfo={"fuse_input_layernorm": fuse},
     )
