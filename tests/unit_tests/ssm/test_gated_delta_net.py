@@ -682,3 +682,64 @@ class TestFusedThdAllToAll:
         back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
 
         assert torch.equal(back, local_t), "Batched cp2hp -> hp2cp not identity"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestForwardSubstitutionSolve:
+    """Tests for the Triton forward-substitution triangular solve that replaces the
+    64-iteration Python loop in torch_chunk_gated_delta_rule.
+
+    The kernel is not required to be bit-identical to the old Python loop (it uses a
+    tree reduction, not the loop's ILP=4 order). What it MUST guarantee, so Megatron
+    prefill and SGLang stay identical to each other and gradients flow:
+      - run-to-run determinism,
+      - independence from the number of chunks (length invariance),
+      - T = (I - A_strict)^-1 to fp32 tolerance,
+      - correct gradients wrt the input.
+    """
+
+    def _solver(self):
+        from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub
+
+        return _solve_fwd_sub
+
+    def _rand_strict_lower(self, shape, seed, C=64, scale=0.15):
+        torch.manual_seed(seed)
+        return (torch.randn(*shape, C, C, device="cuda", dtype=torch.float32) * scale).tril(-1)
+
+    def test_deterministic(self):
+        solve = self._solver()
+        for seed in range(4):
+            A = self._rand_strict_lower((1, 48, 12), seed)
+            assert torch.equal(solve(A.clone()), solve(A.clone()))
+
+    def test_chunk_count_invariant(self):
+        # The output for a given (b, h, chunk) must not depend on how many chunks exist.
+        solve = self._solver()
+        A = self._rand_strict_lower((1, 48, 12), 0)
+        assert torch.equal(solve(A[:, :, :3].clone()), solve(A.clone())[:, :, :3])
+
+    def test_matches_inverse(self):
+        solve = self._solver()
+        C = 64
+        eye = torch.eye(C, device="cuda")
+        for seed in range(6):
+            A = self._rand_strict_lower((1, 48, 4), seed)
+            T = solve(A.clone()) + eye
+            ref = torch.linalg.inv(eye - A)
+            assert (T - ref).abs().max().item() < 1e-5
+
+    def test_gradients(self):
+        solve = self._solver()
+        C = 64
+        eye = torch.eye(C, device="cuda")
+        for seed in range(4):
+            base = self._rand_strict_lower((48,), seed, scale=0.1)
+            a1 = base.clone().requires_grad_(True)
+            a2 = base.clone().requires_grad_(True)
+            T1 = solve(a1) + eye
+            T2 = torch.linalg.inv(eye - a2.tril(-1))
+            g = torch.randn_like(T1)
+            T1.backward(g)
+            T2.backward(g.clone())
+            assert torch.allclose(a1.grad, a2.grad, atol=1e-5, rtol=1e-3)

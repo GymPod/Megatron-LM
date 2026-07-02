@@ -69,6 +69,14 @@ try:
 except ImportError:
     _sglang_torch_chunk_gdr = None
 
+try:
+    # Shared forward-substitution triangular solve (one Triton launch, bit-identical to
+    # the 64-iter Python loop, length-invariant, differentiable). Same kernel SGLang uses,
+    # so Megatron prefill and SGLang stay bit-for-bit identical.
+    from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub
+except ImportError:
+    _solve_fwd_sub = None
+
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 
 try:
@@ -1287,10 +1295,21 @@ def torch_chunk_gated_delta_rule(
     g = torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    # Forward-substitution triangular solve. One Triton launch (one program per
+    # (b, h, chunk)) replaces the 64 sequential iterations of the Python loop:
+    #   for i in range(1, chunk_size):
+    #       row = attn[..., i, :i]; sub = attn[..., :i, :i]
+    #       attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    # Same shared kernel SGLang uses, so Megatron prefill and SGLang stay identical to
+    # each other. Deterministic, length-invariant, differentiable (~1 fp32 ULP off the
+    # loop). Falls back to the loop if the shared kernel is unavailable (e.g. no SGLang).
+    if _solve_fwd_sub is not None and attn.is_cuda:
+        attn = _solve_fwd_sub(attn)
+    else:
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
