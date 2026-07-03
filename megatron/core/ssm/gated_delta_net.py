@@ -73,9 +73,10 @@ try:
     # Shared forward-substitution triangular solve (one Triton launch, bit-identical to
     # the 64-iter Python loop, length-invariant, differentiable). Same kernel SGLang uses,
     # so Megatron prefill and SGLang stay bit-for-bit identical.
-    from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub
+    from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub, l2norm_bf16
 except ImportError:
     _solve_fwd_sub = None
+    l2norm_bf16 = None
 
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 
@@ -769,10 +770,16 @@ class GatedDeltaNet(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key (PyTorch to match SGLang inference exactly)
+        # Apply L2 norm to query and key. Shared triton l2norm kernel (bit-identical reduction to
+        # SGLang's torch_chunk and the decode prep kernel), so Megatron's teacher-forced forward
+        # matches SGLang decode bit-for-bit. Differentiable via the analytic VJP (see l2norm_bf16).
+        # Falls back to torch when the shared kernel is unavailable (no SGLang / non-CUDA).
         if self.use_qk_l2norm and not skip_l2norm_and_repeat:
-            qk_f = query_key.contiguous().float()
-            query_key = (qk_f * torch.rsqrt((qk_f * qk_f).sum(dim=-1, keepdim=True) + 1e-6)).to(query_key.dtype)
+            if l2norm_bf16 is not None and query_key.is_cuda:
+                query_key = l2norm_bf16(query_key).to(query_key.dtype)
+            else:
+                qk_f = query_key.contiguous().float()
+                query_key = (qk_f * torch.rsqrt((qk_f * qk_f).sum(dim=-1, keepdim=True) + 1e-6)).to(query_key.dtype)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
@@ -1253,10 +1260,18 @@ def torch_chunk_gated_delta_rule(
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        q_f = query.float()
-        k_f = key.float()
-        query = (q_f * torch.rsqrt((q_f * q_f).sum(dim=-1, keepdim=True) + 1e-6)).to(initial_dtype)
-        key = (k_f * torch.rsqrt((k_f * k_f).sum(dim=-1, keepdim=True) + 1e-6)).to(initial_dtype)
+        # Shared triton l2norm: bit-identical reduction to SGLang's torch_chunk and the decode
+        # prep kernel, so Megatron's teacher-forced forward matches SGLang decode bit-for-bit.
+        # Differentiable via the analytic VJP (see l2norm_bf16). Falls back to torch when the
+        # shared kernel is unavailable (no SGLang / non-CUDA).
+        if l2norm_bf16 is not None and query.is_cuda:
+            query = l2norm_bf16(query).to(initial_dtype)
+            key = l2norm_bf16(key).to(initial_dtype)
+        else:
+            q_f = query.float()
+            k_f = key.float()
+            query = (q_f * torch.rsqrt((q_f * q_f).sum(dim=-1, keepdim=True) + 1e-6)).to(initial_dtype)
+            key = (k_f * torch.rsqrt((k_f * k_f).sum(dim=-1, keepdim=True) + 1e-6)).to(initial_dtype)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]

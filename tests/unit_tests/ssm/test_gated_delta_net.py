@@ -765,6 +765,31 @@ class TestForwardSubstitutionSolve:
         A.requires_grad_(True)
         assert torch.autograd.gradcheck(_RefSolve.apply, (A,), atol=1e-6, rtol=1e-4)
 
+    def test_l2norm_gradcheck(self):
+        # Formal finite-difference gradcheck of the shared l2norm's analytic VJP
+        # grad_x = n*grad_y - n^3*x*(grad_y . x), n = rsqrt(sum(x^2)+eps). fp64 exact-forward
+        # sharing _L2NormBf16.backward (the bf16 cast is treated as identity in backward).
+        from sglang.srt.layers.attention.linear.gdn_backend import _L2NormBf16
+
+        eps = 1e-6
+
+        class _RefL2(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                xf = x.contiguous()
+                ctx.save_for_backward(xf)
+                ctx.eps = eps
+                return xf * torch.rsqrt((xf * xf).sum(-1, keepdim=True) + eps)
+
+            @staticmethod
+            def backward(ctx, grad_y):
+                return _L2NormBf16.backward(ctx, grad_y)
+
+        torch.manual_seed(0)
+        x = torch.randn(2, 5, 16, device="cuda", dtype=torch.float64)
+        x.requires_grad_(True)
+        assert torch.autograd.gradcheck(_RefL2.apply, (x,), atol=1e-6, rtol=1e-4)
+
     def test_gradients(self):
         solve = self._solver()
         C = 64
