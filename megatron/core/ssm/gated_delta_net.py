@@ -73,9 +73,14 @@ try:
     # Shared forward-substitution triangular solve (one Triton launch, bit-identical to
     # the 64-iter Python loop, length-invariant, differentiable). Same kernel SGLang uses,
     # so Megatron prefill and SGLang stay bit-for-bit identical.
-    from sglang.srt.layers.attention.linear.gdn_backend import _solve_fwd_sub, l2norm_bf16
+    from sglang.srt.layers.attention.linear.gdn_backend import (
+        _solve_fwd_sub,
+        chunk_cumsum,
+        l2norm_bf16,
+    )
 except ImportError:
     _solve_fwd_sub = None
+    chunk_cumsum = None
     l2norm_bf16 = None
 
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
@@ -1301,13 +1306,14 @@ def torch_chunk_gated_delta_rule(
     )
 
     # chunk decay
-    # Per-chunk cumsum. torch.cumsum on the full [b, h, num_chunks, chunk_size] tensor
-    # batches all num_chunks rows into one reduction whose fp32 accumulation order depends
-    # on the row count, so a longer sequence (more chunks) shifts chunk 0 by ~1 bf16 ULP
-    # (7.6e-6) and propagates through g.exp() to core_attn_out (1.5e-5). Running cumsum per
-    # chunk keeps the reduction row count constant, making it independent of sequence length
-    # so sglang (short prefill) and Megatron (full teacher-forced sequence) match bit-exactly.
-    g = torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
+    # Shared serial fp32 cumsum over the chunk dim (see chunk_cumsum in gdn_backend). A serial
+    # left-to-right scan is length-invariant (C adds/row regardless of chunk count) so Megatron
+    # (full teacher-forced sequence) and sglang (short prefill) match bit-exactly, and the sglang
+    # decode incremental append gcum[i]=gcum[i-1]+g[i] is bit-identical to it by construction.
+    if chunk_cumsum is not None and g.is_cuda:
+        g = chunk_cumsum(g)
+    else:
+        g = torch.stack([g[:, :, i].cumsum(dim=-1) for i in range(g.shape[2])], dim=2)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
     # Forward-substitution triangular solve. One Triton launch (one program per

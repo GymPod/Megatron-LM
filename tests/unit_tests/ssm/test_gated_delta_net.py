@@ -790,6 +790,38 @@ class TestForwardSubstitutionSolve:
         x.requires_grad_(True)
         assert torch.autograd.gradcheck(_RefL2.apply, (x,), atol=1e-6, rtol=1e-4)
 
+    def test_chunk_cumsum_gradcheck(self):
+        # Formal finite-difference gradcheck of the shared serial-cumsum VJP
+        # grad_x[i] = sum_{j>=i} grad_y[j] (reverse cumsum). fp64 exact-forward sharing
+        # _ChunkCumsum.backward.
+        from sglang.srt.layers.attention.linear.gdn_backend import _ChunkCumsum
+
+        class _RefCumsum(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, g):
+                return g.cumsum(-1)
+
+            @staticmethod
+            def backward(ctx, grad_y):
+                return _ChunkCumsum.backward(ctx, grad_y)
+
+        torch.manual_seed(0)
+        g = torch.randn(1, 4, 3, 64, device="cuda", dtype=torch.float64)
+        g.requires_grad_(True)
+        assert torch.autograd.gradcheck(_RefCumsum.apply, (g,), atol=1e-6, rtol=1e-4)
+
+    def test_chunk_cumsum_matches_torch(self):
+        # Serial scan equals torch per-chunk cumsum to fp32 tolerance and is length-invariant.
+        from sglang.srt.layers.attention.linear.gdn_backend import chunk_cumsum
+
+        torch.manual_seed(0)
+        g = torch.randn(1, 48, 4, 64, device="cuda", dtype=torch.float32) * 0.1
+        ref = torch.stack([g[:, :, i].cumsum(-1) for i in range(g.shape[2])], dim=2)
+        out = chunk_cumsum(g)
+        assert (out - ref).abs().max().item() < 1e-5
+        # chunk 0 must not depend on how many chunks exist (length invariance).
+        assert torch.equal(chunk_cumsum(g[:, :, :2])[:, :, 0], out[:, :, 0])
+
     def test_gradients(self):
         solve = self._solver()
         C = 64
