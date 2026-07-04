@@ -15,7 +15,6 @@ from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -1708,8 +1707,11 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
-    @jit_fuser
     def _apply_output_gate(self, x, gate):
+        # No @jit_fuser: torch.compile fuses sigmoid+multiply into a Triton kernel that
+        # rounds x * sigmoid(gate.float()) differently from eager at round-to-nearest-even
+        # ties (dense layer 35 t=32 h=605 flipped 1 bf16 ULP: 0xbd78 vs sglang 0xbd79).
+        # Eager matches sglang's Qwen3_5AttentionDecoderLayer.self_attention gate bit-for-bit.
         x_dtype = x.dtype
         gate = gate.contiguous()
         gate = gate.view(*x.shape)
