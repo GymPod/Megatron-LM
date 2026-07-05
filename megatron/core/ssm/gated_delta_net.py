@@ -74,11 +74,13 @@ try:
     # the 64-iter Python loop, length-invariant, differentiable). Same kernel SGLang uses,
     # so Megatron prefill and SGLang stay bit-for-bit identical.
     from sglang.srt.layers.attention.linear.gdn_backend import (
+        _fused_chunk_scan,
         _solve_fwd_sub,
         chunk_cumsum,
         l2norm_bf16,
     )
 except ImportError:
+    _fused_chunk_scan = None
     _solve_fwd_sub = None
     chunk_cumsum = None
     l2norm_bf16 = None
@@ -1339,23 +1341,42 @@ def torch_chunk_gated_delta_rule(
         if initial_state is None
         else initial_state.to(value)
     )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
-    )
+    num_chunks = total_sequence_length // chunk_size
 
-    # for each chunk
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+    # Cross-chunk serial recurrence over last_recurrent_state. When grad is disabled (log-prob
+    # dump / inference) route through the SAME fused Triton scan sglang's torch_chunk uses, so
+    # Megatron and sglang prefill are bit-identical by construction (both call _fused_chunk_scan)
+    # and ~6x faster than this python loop. Training keeps the loop so gradients flow through
+    # autograd. Falls back to the loop off-CUDA / when sglang (hence the kernel) is unavailable.
+    use_fused_scan = (
+        _fused_chunk_scan is not None and query.is_cuda and not torch.is_grad_enabled()
+    )
+    if use_fused_scan:
+        nchunks = torch.full(
+            (batch_size,), num_chunks, dtype=torch.int32, device=query.device
         )
+        core_attn_out, last_recurrent_state, _ = _fused_chunk_scan(
+            query.contiguous(), key.contiguous(), g.contiguous(),
+            value.contiguous(), k_cumdecay.contiguous(),
+            last_recurrent_state.contiguous(), nchunks, -1, False,
+        )
+    else:
+        core_attn_out = torch.zeros_like(value)
+        mask = torch.triu(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+        )
+        # for each chunk
+        for i in range(0, num_chunks):
+            q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+            attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+            v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+            v_new = v_i - v_prime
+            attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+            core_attn_out[:, :, i] = attn_inter + attn @ v_new
+            last_recurrent_state = (
+                last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            )
 
     if not output_final_state:
         last_recurrent_state = None
