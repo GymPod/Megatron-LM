@@ -74,12 +74,14 @@ try:
     # the 64-iter Python loop, length-invariant, differentiable). Same kernel SGLang uses,
     # so Megatron prefill and SGLang stay bit-for-bit identical.
     from sglang.srt.layers.attention.linear.gdn_backend import (
+        _ChunkGDR,
         _fused_chunk_scan,
         _solve_fwd_sub,
         chunk_cumsum,
         l2norm_bf16,
     )
 except ImportError:
+    _ChunkGDR = None
     _fused_chunk_scan = None
     _solve_fwd_sub = None
     chunk_cumsum = None
@@ -1293,8 +1295,35 @@ def torch_chunk_gated_delta_rule(
     g = F.pad(g, (0, pad_size))
     total_sequence_length = sequence_length + pad_size
     scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
+    num_chunks = total_sequence_length // chunk_size
+    last_recurrent_state = (
+        torch.zeros(
+            batch_size, num_heads, k_head_dim, v_head_dim,
+            device=query.device, dtype=query.dtype,
+        )
+        if initial_state is None
+        else initial_state.to(query)
+    )
 
+    # Training (grad on): run the whole WY prep + cross-chunk scan inside _ChunkGDR, one autograd
+    # Function whose backward is fla's analytic chunk_gated_delta_rule_bwd driven from OUR saved
+    # tensors (our T-matrix, our fp32 cumsum). Its forward uses the SAME deterministic kernels as
+    # the inference path below, so Megatron training and sglang training forwards agree, and it
+    # gets the fused-scan speedup too. Falls back to the differentiable torch path if fla/CUDA is
+    # unavailable.
+    if _ChunkGDR is not None and query.is_cuda and torch.is_grad_enabled():
+        core_attn_out, last_recurrent_state = _ChunkGDR.apply(
+            query, key, value, g, beta, last_recurrent_state, chunk_size
+        )
+        if not output_final_state:
+            last_recurrent_state = None
+        core_attn_out = core_attn_out.reshape(
+            core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+        )
+        core_attn_out = core_attn_out[:, :, :sequence_length]
+        return core_attn_out.transpose(1, 2).contiguous().to(initial_dtype), last_recurrent_state
+
+    query = query * scale
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
     # reshape to chunks
@@ -1336,18 +1365,12 @@ def torch_chunk_gated_delta_rule(
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    num_chunks = total_sequence_length // chunk_size
 
-    # Cross-chunk serial recurrence over last_recurrent_state. When grad is disabled (log-prob
-    # dump / inference) route through the SAME fused Triton scan sglang's torch_chunk uses, so
-    # Megatron and sglang prefill are bit-identical by construction (both call _fused_chunk_scan)
-    # and ~6x faster than this python loop. Training keeps the loop so gradients flow through
-    # autograd. Falls back to the loop off-CUDA / when sglang (hence the kernel) is unavailable.
+    # Cross-chunk serial recurrence over last_recurrent_state. Grad off (log-prob dump / inference)
+    # routes through the SAME fused Triton scan sglang uses, so Megatron and sglang prefill are
+    # bit-identical by construction (both call _fused_chunk_scan) and ~6x faster than this python
+    # loop. This raw-kernel scan is non-differentiable; grad-on only reaches here when fla is
+    # unavailable (else _ChunkGDR handled it above), where it uses the torch loop.
     use_fused_scan = (
         _fused_chunk_scan is not None and query.is_cuda and not torch.is_grad_enabled()
     )
