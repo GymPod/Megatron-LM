@@ -831,12 +831,10 @@ def validate_args(args, defaults={}):
                 )
                 args.mtp_num_layers = inferred_mtp_num_layers
 
-    # MTP validation
-    if args.mtp_num_layers:
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
-        )
+    # NOTE: MTP position-embedding-type validation is done later (after the legacy
+    # --use-rotary-position-embeddings -> position_embedding_type='rope' conversion),
+    # so it is not duplicated here. Doing it at this point runs before that conversion
+    # and spuriously rejects configs that set --use-rotary-position-embeddings.
 
     # Validate MTP args for hybrid vs non-hybrid models
     if args.hybrid_layer_pattern is not None:
